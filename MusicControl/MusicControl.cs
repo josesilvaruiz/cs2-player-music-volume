@@ -2,7 +2,6 @@ using System.Text.Json;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.Commands;
-using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.UserMessages;
 using CounterStrikeSharp.API.Modules.Utils;
 
@@ -10,10 +9,10 @@ namespace MusicControl;
 
 public class MusicControl : BasePlugin
 {
-    public override string ModuleName => "Music Control";
-    public override string ModuleVersion => "3.5.0";
-    public override string ModuleAuthor => "Torment";
-    public override string ModuleDescription => "Per-player map music volume control + radio";
+    public override string ModuleName        => "Music Control";
+    public override string ModuleVersion     => "3.5.0";
+    public override string ModuleAuthor      => "Torment";
+    public override string ModuleDescription => "Per-player map music volume control + internet radio";
 
     private readonly Dictionary<ulong, float> _playerVolume = [];
 
@@ -28,24 +27,16 @@ public class MusicControl : BasePlugin
 
     // ── Radio ─────────────────────────────────────────────────────────────────
 
-    private record RadioTrack(string Path, int DurationSeconds);
-
     private class RadioConfig
     {
-        public float DuckVolume { get; set; } = 0.2f;
-        public List<RadioTrackEntry> Tracks { get; set; } = [];
+        public string RadioUrl    { get; set; } = "";
+        public string RadioName   { get; set; } = "Radio del Servidor";
+        public float  DuckVolume  { get; set; } = 0.3f;
     }
 
-    private class RadioTrackEntry
-    {
-        public string Path { get; set; } = "";
-        public int Duration { get; set; } = 180;
-    }
-
-    private List<RadioTrack> _radioTracks = [];
-    private int _currentTrackIndex = -1;
-    private CounterStrikeSharp.API.Modules.Timers.Timer? _trackTimer;
-    private float _duckVolume = 0.2f;
+    private string  _radioUrl   = "";
+    private string  _radioName  = "Radio";
+    private float   _duckVolume = 0.3f;
     private readonly Dictionary<ulong, bool> _radioEnabled = [];
 
     private string RadioConfigPath =>
@@ -59,7 +50,7 @@ public class MusicControl : BasePlugin
         LoadRadioConfig();
 
         AddCommand("css_music", "Toggle or set music volume (usage: !music [0-100])", OnMusicCommand);
-        AddCommand("css_radio", "Toggle radio on/off (usage: !radio [on|off])", OnRadioCommand);
+        AddCommand("css_radio", "Toggle internet radio on/off", OnRadioCommand);
 
         HookUserMessage(208, OnSosStartSoundEvent);
 
@@ -71,12 +62,10 @@ public class MusicControl : BasePlugin
     public override void Unload(bool hotReload)
     {
         SaveToJson();
-        _trackTimer?.Kill();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    // Effective map-music volume for a player, respecting radio duck.
     private float GetEffectiveMusicVolume(ulong steamId)
     {
         float vol = _playerVolume.GetValueOrDefault(steamId, 1.0f);
@@ -84,9 +73,6 @@ public class MusicControl : BasePlugin
             return Math.Min(vol, _duckVolume);
         return vol;
     }
-
-    private bool AnyRadioListener() =>
-        _radioEnabled.Values.Any(v => v);
 
     // ── !music command ────────────────────────────────────────────────────────
 
@@ -99,7 +85,7 @@ public class MusicControl : BasePlugin
         float target;
         if (info.ArgCount >= 2 && int.TryParse(info.ArgByIndex(1), out int pct))
         {
-            pct = Math.Clamp(pct, 0, 100);
+            pct    = Math.Clamp(pct, 0, 100);
             target = pct / 100f;
         }
         else
@@ -132,14 +118,14 @@ public class MusicControl : BasePlugin
     {
         if (player == null || !player.IsValid) return;
 
-        if (_radioTracks.Count == 0)
+        if (string.IsNullOrWhiteSpace(_radioUrl))
         {
-            player.PrintToChat(" \x01[Radio] \x02No hay pistas configuradas en radio.json.");
+            player.PrintToChat(" \x01[Radio] \x02No hay URL configurada en radio.json.");
             return;
         }
 
         bool current = _radioEnabled.GetValueOrDefault(player.SteamID, false);
-        bool enable = !current;
+        bool enable  = !current;
 
         if (info.ArgCount >= 2)
         {
@@ -151,70 +137,30 @@ public class MusicControl : BasePlugin
 
         if (enable)
         {
-            // Duck map music
+            // Bajar música del mapa si la hay
             float duck = GetEffectiveMusicVolume(player.SteamID);
             foreach (var evt in _activeEvents)
                 SendVolume(player, evt.Guid, duck);
 
-            // Start or join the current track
-            if (_currentTrackIndex < 0)
-                PlayTrack(0, startTimer: true);
-            else
-                player.ExecuteClientCommand($"play \"{_radioTracks[_currentTrackIndex].Path}\"");
-
-            int displayIdx = Math.Max(0, _currentTrackIndex);
-            player.PrintToChat($" \x01[Radio] \x04Radio ON \x01— \x05{_radioTracks[displayIdx].Path}");
+            player.PrintToChat($" \x01[Radio] \x04► {_radioName}");
+            player.PrintToChat($" \x01[Radio] \x01Abre en tu navegador: \x05{_radioUrl}");
+            player.PrintToChat($" \x01[Radio] \x08Escribe \x05!radio\x08 para quitar este mensaje.");
         }
         else
         {
-            // Restore map music to player's preferred volume
+            _radioEnabled[player.SteamID] = false;
+
+            // Restaurar volumen del mapa
             float vol = _playerVolume.GetValueOrDefault(player.SteamID, 1.0f);
             foreach (var evt in _activeEvents)
                 SendVolume(player, evt.Guid, vol);
 
-            player.PrintToChat(" \x01[Radio] \x02Radio OFF.");
-
-            // Stop the server-side timer if no one is listening anymore
-            if (!AnyRadioListener())
-            {
-                _trackTimer?.Kill();
-                _trackTimer = null;
-                _currentTrackIndex = -1;
-            }
+            player.PrintToChat(" \x01[Radio] \x02Radio desactivada.");
         }
     }
 
-    // ── Radio playback ────────────────────────────────────────────────────────
+    // ── Radio panel (MOTD HTML) ───────────────────────────────────────────────
 
-    private void PlayTrack(int index, bool startTimer)
-    {
-        _currentTrackIndex = index % _radioTracks.Count;
-        var track = _radioTracks[_currentTrackIndex];
-
-        foreach (var p in Utilities.GetPlayers())
-        {
-            if (!p.IsValid) continue;
-            if (!_radioEnabled.GetValueOrDefault(p.SteamID, false)) continue;
-            p.ExecuteClientCommand($"play \"{track.Path}\"");
-        }
-
-        if (startTimer)
-        {
-            _trackTimer?.Kill();
-            _trackTimer = AddTimer(track.DurationSeconds, OnTrackEnd);
-        }
-    }
-
-    private void OnTrackEnd()
-    {
-        if (!AnyRadioListener())
-        {
-            _currentTrackIndex = -1;
-            _trackTimer = null;
-            return;
-        }
-        PlayTrack((_currentTrackIndex + 1) % _radioTracks.Count, startTimer: true);
-    }
 
     // ── Radio config ──────────────────────────────────────────────────────────
 
@@ -226,25 +172,24 @@ public class MusicControl : BasePlugin
             {
                 var def = new RadioConfig
                 {
-                    DuckVolume = 0.2f,
-                    Tracks = [new RadioTrackEntry { Path = "radio/example.mp3", Duration = 180 }]
+                    RadioUrl   = "http://stream.radioparadise.com/rock-192",
+                    RadioName  = "Radio del Servidor",
+                    DuckVolume = 0.3f
                 };
                 File.WriteAllText(RadioConfigPath,
                     JsonSerializer.Serialize(def, new JsonSerializerOptions { WriteIndented = true }));
-                Console.WriteLine("[MusicControl] radio.json creado — edítalo para añadir tus pistas.");
+                Console.WriteLine("[MusicControl] radio.json creado — pon tu URL de stream.");
                 return;
             }
 
             var cfg = JsonSerializer.Deserialize<RadioConfig>(File.ReadAllText(RadioConfigPath));
             if (cfg == null) return;
 
+            _radioUrl   = cfg.RadioUrl.Trim();
+            _radioName  = string.IsNullOrWhiteSpace(cfg.RadioName) ? "Radio" : cfg.RadioName;
             _duckVolume = Math.Clamp(cfg.DuckVolume, 0f, 1f);
-            _radioTracks = cfg.Tracks
-                .Where(t => !string.IsNullOrWhiteSpace(t.Path) && t.Duration > 0)
-                .Select(t => new RadioTrack(t.Path, t.Duration))
-                .ToList();
 
-            Console.WriteLine($"[MusicControl] Radio: {_radioTracks.Count} pistas cargadas, duck={_duckVolume:P0}");
+            Console.WriteLine($"[MusicControl] Radio: '{_radioName}' — {_radioUrl} (duck={_duckVolume:P0})");
         }
         catch (Exception ex)
         {
@@ -331,22 +276,22 @@ public class MusicControl : BasePlugin
 
     private static byte[] BuildVolumeParams(float volume)
     {
-        byte[] vol = BitConverter.GetBytes(volume);
+        byte[] vol    = BitConverter.GetBytes(volume);
         byte[] result = new byte[VolumeParamHeader.Length + vol.Length];
         VolumeParamHeader.CopyTo(result, 0);
         vol.CopyTo(result, VolumeParamHeader.Length);
         return result;
     }
 
-    private static void PrintVolumeMessage(CCSPlayerController player, float volume)
+    private void PrintVolumeMessage(CCSPlayerController player, float volume)
     {
         int pct = (int)(volume * 100);
         if (pct == 0)
-            player.PrintToChat(" \x01[Music v3.5.0] \x02Música desactivada ✘");
+            player.PrintToChat($" \x01[Music v{ModuleVersion}] \x02Música desactivada ✘");
         else if (pct == 100)
-            player.PrintToChat(" \x01[Music v3.5.0] \x04Música activada (100%) ✔");
+            player.PrintToChat($" \x01[Music v{ModuleVersion}] \x04Música activada (100%) ✔");
         else
-            player.PrintToChat($" \x01[Music v3.5.0] \x05Volumen: {pct}%");
+            player.PrintToChat($" \x01[Music v{ModuleVersion}] \x05Volumen: {pct}%");
     }
 
     // ── Persistence (JSON) ───────────────────────────────────────────────────
@@ -401,13 +346,6 @@ public class MusicControl : BasePlugin
             SaveToJson();
             _playerVolume.Remove(p.SteamID);
             _radioEnabled.Remove(p.SteamID);
-
-            if (!AnyRadioListener())
-            {
-                _trackTimer?.Kill();
-                _trackTimer = null;
-                _currentTrackIndex = -1;
-            }
         }
         return HookResult.Continue;
     }
@@ -433,9 +371,11 @@ public class MusicControl : BasePlugin
                     SendVolume(player, evt.Guid, vol);
             }
 
-            // Resume radio for player if they had it active
-            if (_radioEnabled.GetValueOrDefault(player.SteamID, false) && _currentTrackIndex >= 0)
-                player.ExecuteClientCommand($"play \"{_radioTracks[_currentTrackIndex].Path}\"");
+            // Recordar URL de radio si el jugador la tenía activa
+            if (_radioEnabled.GetValueOrDefault(player.SteamID, false))
+            {
+                player.PrintToChat($" \x01[Radio] \x04► {_radioName}: \x05{_radioUrl}");
+            }
         });
 
         return HookResult.Continue;
